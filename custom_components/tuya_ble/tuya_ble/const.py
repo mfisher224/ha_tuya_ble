@@ -13,7 +13,21 @@ SERVICE_UUID = "0000a201-0000-1000-8000-00805f9b34fb"
 
 MANUFACTURER_DATA_ID = 0x07D0
 
-RESPONSE_WAIT_TIMEOUT = 60
+# Tuya BLE devices answer within about a second once connected. A long wait
+# only delays the retry when a reply is lost.
+RESPONSE_WAIT_TIMEOUT = 10
+
+# Connection attempts per _ensure_connected call, and the delay between them.
+CONNECT_ATTEMPTS = 5
+CONNECT_RETRY_DELAY = 1.0
+
+# Backoff for automatic reconnects after an unexpected disconnect.
+RECONNECT_MIN_DELAY = 5.0
+RECONNECT_MAX_DELAY = 300.0
+
+# Categories of battery devices that sleep between actions and must not be
+# kept connected (kg = Fingerbot, szjqr = Fingerbot Plus / CubeTouch).
+NO_AUTO_RECONNECT_CATEGORIES = ("kg", "szjqr")
 
 
 class TuyaBLECode(Enum):

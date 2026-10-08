@@ -36,8 +36,13 @@ from ..const import (
 from .const import (
     CHARACTERISTIC_NOTIFY,
     CHARACTERISTIC_WRITE,
+    CONNECT_ATTEMPTS,
+    CONNECT_RETRY_DELAY,
     GATT_MTU,
     MANUFACTURER_DATA_ID,
+    NO_AUTO_RECONNECT_CATEGORIES,
+    RECONNECT_MAX_DELAY,
+    RECONNECT_MIN_DELAY,
     RESPONSE_WAIT_TIMEOUT,
     SERVICE_UUID,
     TuyaBLECode,
@@ -146,7 +151,7 @@ class TuyaBLEDataPoint:
         return f"{{id:{self.id} type:{self.type} value:{self.value}}}"
 
     def __str__(self):
-        return f"{self}"
+        return self.__repr__()
 
     async def set_value(self, value: bytes | bool | int | str) -> None:
         match self._type:
@@ -292,9 +297,23 @@ class TuyaBLEDevice:
 
         self._is_paired = False
 
+        # Whether to reconnect on its own after an unexpected disconnect.
+        # Battery devices that sleep between actions (Fingerbots) should
+        # connect on demand instead; set by the integration at setup.
+        self.auto_reconnect = True
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_delay = RECONNECT_MIN_DELAY
+        # Clients we are deliberately tearing down; their disconnect
+        # callbacks must not touch the state of the current connection.
+        self._dropping_clients: set[int] = set()
+
         self._input_buffer: bytearray | None = None
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
+        # True after a lost fragment, until the next message starts.
+        self._input_discarding = False
+        # Last fragment accepted, used to drop duplicated notifications.
+        self._input_last_fragment: bytes | None = None
         self._input_expected_responses: dict[int,
                                              asyncio.Future[int] | None] = {}
         # self._input_future: asyncio.Future[int] | None = None
@@ -384,8 +403,7 @@ class TuyaBLEDevice:
         self.append_functions(description.function, description.status_range)
 
         if description.values_overrides:
-            for key in description.values_overrides:
-                values = description.values_overrides.values
+            for key, values in description.values_overrides.items():
                 if f := self.function.get(key):
                     f.values = values
 
@@ -393,12 +411,11 @@ class TuyaBLEDevice:
                     f.values = values
 
         if description.values_defaults:
-            for key in description.values_defaults:
-                values = description.values_defaults.values
-                if f := self.function.get(key) and not f.values:
+            for key, values in description.values_defaults.items():
+                if (f := self.function.get(key)) and not f.values:
                     f.values = values
 
-                if f := self.status_range.get(key) and not f.values:
+                if (f := self.status_range.get(key)) and not f.values:
                     f.values = values
 
     def _decode_advertisement_data(self) -> None:
@@ -631,8 +648,17 @@ class TuyaBLEDevice:
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
+        if id(client) in self._dropping_clients or (
+            self._client is not None and client is not self._client
+        ):
+            # A client we already abandoned finished disconnecting. It must
+            # not reset the state of the connection that replaced it.
+            self._dropping_clients.discard(id(client))
+            _LOGGER.debug("%s: Old connection closed", self.address)
+            return
         was_paired = self._is_paired
         self._is_paired = False
+        self._fail_pending_responses()
         if self._expected_disconnect:
             _LOGGER.debug(
                 "%s: Disconnected from device; RSSI: %s",
@@ -645,35 +671,73 @@ class TuyaBLEDevice:
         self._client = None
         self._fire_connection_status_callbacks()
         
-        if was_paired:
-            # Decide whether to schedule an automatic reconnect.
-            # For power-saving switches (category "kg") we want to avoid
-            # persistent reconnect attempts because the device sleeps.
-            is_switch_category = False
-            if getattr(self, "category", None) == "kg":
-                is_switch_category = True
-
-            # Don't reconnect if device is switch
-            if is_switch_category:
-                _LOGGER.debug(
-                    "%s: Device unexpectedly disconnected, but category indicates a switch (category=%s); not scheduling automatic reconnect",
-                    self.address,
-                    getattr(self, "category", None),
-                )
-            # Schedule reconnect
-            else:
-                _LOGGER.warning(
-                    "%s: Device unexpectedly disconnected, scheduling reconnect; RSSI: %s",
-                    self.address,
-                    self.rssi,
-                )
-                asyncio.create_task(self._reconnect())
-        else:
-            _LOGGER.warning(
-                "%s: Device unexpectedly disconnected; RSSI: %s",
+        if not was_paired:
+            _LOGGER.debug(
+                "%s: Disconnected before pairing completed; RSSI: %s",
                 self.address,
                 self.rssi,
             )
+        elif not self._should_auto_reconnect():
+            # Sleepy battery devices (Fingerbots) drop the link a few
+            # minutes after each action. That is normal: the next command
+            # reconnects on demand. Reconnecting here would wake the device
+            # in a loop and drain its battery.
+            _LOGGER.debug(
+                "%s: Device went to sleep; will reconnect on next command",
+                self.address,
+            )
+        else:
+            _LOGGER.info(
+                "%s: Device unexpectedly disconnected, scheduling reconnect; RSSI: %s",
+                self.address,
+                self.rssi,
+            )
+            self._schedule_reconnect()
+
+    def _should_auto_reconnect(self) -> bool:
+        """Return whether to keep this device connected."""
+        return self.auto_reconnect and (
+            self.category not in NO_AUTO_RECONNECT_CATEGORIES
+        )
+
+    def _fail_pending_responses(self) -> None:
+        """Fail requests still waiting for a reply from a dropped link."""
+        for future in self._input_expected_responses.values():
+            if future is not None and not future.done():
+                future.set_exception(BleakError("Disconnected"))
+        self._input_expected_responses.clear()
+        self._clean_input()
+
+    async def _drop_client(self, client: BleakClientWithServiceCache | None) -> None:
+        """Close a connection we are giving up on.
+
+        Only forgetting the client would leave the link open, still
+        subscribed to notifications. The next connection to the same
+        device would then receive every notification twice.
+        """
+        if self._client is client:
+            self._client = None
+        if client is None:
+            return
+        self._dropping_clients.add(id(client))
+        try:
+            if client.is_connected:
+                try:
+                    await client.stop_notify(CHARACTERISTIC_NOTIFY)
+                except Exception:  # noqa: BLE001
+                    pass
+                await client.disconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("%s: Error closing old connection", self.address,
+                          exc_info=True)
+        finally:
+            if not client.is_connected:
+                self._dropping_clients.discard(id(client))
+
+    def _schedule_reconnect(self) -> None:
+        """Start a single background reconnect loop if none is running."""
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(self._reconnect())
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -700,164 +764,140 @@ class TuyaBLEDevice:
             self._current_seq_num = 1
 
     async def _ensure_connected(self) -> None:
-        """Ensure connection to device is established."""
-        global global_connect_lock
+        """Ensure connection to device is established and paired."""
         if self._expected_disconnect:
+            return
+        if self._client and self._client.is_connected and self._is_paired:
             return
         if self._connect_lock.locked():
             _LOGGER.debug(
-                "%s: Connection already in progress,"
-                " waiting for it to complete; RSSI: %s",
+                "%s: Connection already in progress, waiting; RSSI: %s",
                 self.address,
                 self.rssi,
             )
-        if self._client and self._client.is_connected and self._is_paired:
-            return
         async with self._connect_lock:
-            # Check again while holding the lock
-            await asyncio.sleep(0.01)
             if self._client and self._client.is_connected and self._is_paired:
                 return
-            attempts_count = 100
-            while attempts_count > 0:
-                attempts_count -= 1
-                if attempts_count == 0:
-                    _LOGGER.error(
-                        "%s: Connecting, all attempts failed; RSSI: %s",
-                        self.address,
-                        self.rssi,
-                    )
-                    raise BleakNotFoundError()
-                try:
-                    async with global_connect_lock:
-                        _LOGGER.debug(
-                            "%s: Connecting; RSSI: %s", self.address, self.rssi
-                        )
-                        client = await establish_connection(
-                            BleakClientWithServiceCache,
-                            self._ble_device,
-                            self.address,
-                            self._disconnected,
-                            use_services_cache=True,
-                            ble_device_callback=lambda: self._ble_device,
-                        )
-                except BleakNotFoundError:
-                    _LOGGER.error(
-                        "%s: device not found, not in range, or poor RSSI: %s",
-                        self.address,
-                        self.rssi,
-                        exc_info=True,
-                    )
-                    continue
-                except BLEAK_EXCEPTIONS:
-                    _LOGGER.debug(
-                        "%s: communication failed", self.address, exc_info=True
-                    )
-                    continue
-                except:
-                    _LOGGER.debug("%s: unexpected error",
-                                  self.address, exc_info=True)
-                    continue
-
-                if client and client.is_connected:
-                    _LOGGER.debug("%s: Connected; RSSI: %s",
-                                  self.address, self.rssi)
-                    self._client = client
-                    try:
-                        await self._client.start_notify(
-                            CHARACTERISTIC_NOTIFY, self._notification_handler
-                        )
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: starting notifications failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug(
-                        "%s: Sending device info request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                            bytes(0),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending device info request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending device info request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending pairing request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_PAIR,
-                            self._build_pairing_request(),
-                            0,
-                            True,
-                        ):
-                            self._client = None
-                            _LOGGER.error(
-                                "%s: Sending pairing request failed",
-                                self.address,
-                            )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: Sending pairing request failed",
-                                      self.address, exc_info=True)
-                        continue
-                else:
-                    continue
-
-                break
-
-        if self._client:
-            if self._client.is_connected:
-                if self._is_paired:
-                    _LOGGER.debug("%s: Successfully connected", self.address)
-                    self._fire_connected_callbacks()
-                    self._fire_connection_status_callbacks()
-                else:
-                    _LOGGER.error("%s: Connected but not paired", self.address)
+            last_error = "unknown"
+            for attempt in range(1, CONNECT_ATTEMPTS + 1):
+                if self._expected_disconnect:
+                    return
+                if attempt > 1:
+                    # Give the radio and the device a moment between tries.
+                    await asyncio.sleep(CONNECT_RETRY_DELAY * (attempt - 1))
+                error = await self._try_connect_and_pair()
+                if error is None:
+                    break
+                last_error = error
+                _LOGGER.debug(
+                    "%s: Connection attempt %s/%s failed: %s; RSSI: %s",
+                    self.address,
+                    attempt,
+                    CONNECT_ATTEMPTS,
+                    error,
+                    self.rssi,
+                )
             else:
-                _LOGGER.error("%s: Not connected", self.address)
-        else:
-            _LOGGER.error("%s: No client device", self.address)
+                _LOGGER.warning(
+                    "%s: Could not connect after %s attempts (last error: %s); RSSI: %s",
+                    self.address,
+                    CONNECT_ATTEMPTS,
+                    last_error,
+                    self.rssi,
+                )
+                raise BleakNotFoundError(
+                    f"{self.address}: could not connect ({last_error})"
+                )
 
-    async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
-        _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
+        self._reconnect_delay = RECONNECT_MIN_DELAY
+        _LOGGER.debug("%s: Successfully connected", self.address)
+        self._fire_connected_callbacks()
+        self._fire_connection_status_callbacks()
+
+    async def _try_connect_and_pair(self) -> str | None:
+        """Make one full connect + handshake attempt.
+
+        Returns None on success, otherwise a short reason. Any half-open
+        connection is closed before returning, so a failed attempt never
+        leaves a second subscription behind.
+        """
+        # Close whatever is left of a previous link first.
+        if self._client is not None:
+            await self._drop_client(self._client)
+        self._is_paired = False
+        self._clean_input()
         async with self._seq_num_lock:
             self._current_seq_num = 1
+
         try:
-            if self._expected_disconnect:
-                return
-            await self._ensure_connected()
-            if self._expected_disconnect:
-                return
-            _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
-        except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
-            _LOGGER.debug(
-                "%s: Reconnect, failed to ensure connection - backing off",
-                self.address,
-                exc_info=True,
+            async with global_connect_lock:
+                _LOGGER.debug("%s: Connecting; RSSI: %s", self.address, self.rssi)
+                client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    self._ble_device,
+                    self.address,
+                    self._disconnected,
+                    use_services_cache=True,
+                    ble_device_callback=lambda: self._ble_device,
+                )
+        except BleakNotFoundError:
+            return "device not found or out of range"
+        except BLEAK_EXCEPTIONS as ex:
+            return f"connect failed: {type(ex).__name__}"
+        except Exception as ex:  # noqa: BLE001
+            _LOGGER.debug("%s: unexpected connect error", self.address,
+                          exc_info=True)
+            return f"connect failed: {type(ex).__name__}"
+
+        if not client or not client.is_connected:
+            return "connect returned no link"
+        self._client = client
+
+        try:
+            await client.start_notify(
+                CHARACTERISTIC_NOTIFY, self._notification_handler
             )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.address)
-            asyncio.create_task(self._reconnect())
+        except Exception as ex:  # noqa: BLE001
+            await self._drop_client(client)
+            return f"starting notifications failed: {type(ex).__name__}"
+
+        for step, code, payload in (
+            ("device info", TuyaBLECode.FUN_SENDER_DEVICE_INFO, bytes(0)),
+            ("pairing", TuyaBLECode.FUN_SENDER_PAIR, None),
+        ):
+            if payload is None:
+                payload = self._build_pairing_request()
+            try:
+                ok = await self._send_packet_while_connected(code, payload, 0, True)
+            except Exception as ex:  # noqa: BLE001
+                ok = False
+                _LOGGER.debug("%s: %s request error: %s", self.address, step, ex)
+            if not ok or self._client is not client or not client.is_connected:
+                await self._drop_client(client)
+                return f"{step} request failed"
+
+        if not self._is_paired:
+            await self._drop_client(client)
+            return "device rejected pairing"
+        return None
+
+    async def _reconnect(self) -> None:
+        """Keep trying to reconnect, backing off between attempts."""
+        while not self._expected_disconnect and self._should_auto_reconnect():
+            if self.connected:
+                return
+            try:
+                await self._ensure_connected()
+                return
+            except BLEAK_EXCEPTIONS:
+                delay = self._reconnect_delay
+                self._reconnect_delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                _LOGGER.debug(
+                    "%s: Reconnect failed, next attempt in %ss",
+                    self.address,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -1018,18 +1058,33 @@ class TuyaBLEDevice:
             )
         packets: list[bytes] = self._build_packets(
             seq_num, code, data, response_to)
-        await self._int_send_packet_while_connected(packets)
+        try:
+            await self._int_send_packet_while_connected(packets)
+        except BaseException:
+            self._input_expected_responses.pop(seq_num, None)
+            raise
         if future:
             try:
                 await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
             except asyncio.TimeoutError:
-                _LOGGER.error(
-                    "%s: timeout receiving response, RSSI: %s",
+                _LOGGER.debug(
+                    "%s: No reply to %s within %ss; RSSI: %s",
                     self.address,
+                    code.name,
+                    RESPONSE_WAIT_TIMEOUT,
                     self.rssi,
                 )
                 result = False
-            self._input_expected_responses.pop(seq_num, None)
+            except BleakError:
+                # The link dropped while we were waiting.
+                _LOGGER.debug(
+                    "%s: Disconnected while waiting for reply to %s",
+                    self.address,
+                    code.name,
+                )
+                result = False
+            finally:
+                self._input_expected_responses.pop(seq_num, None)
 
         return result
 
@@ -1088,7 +1143,7 @@ class TuyaBLEDevice:
             if self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise BleakError from ex
         except BleakError as ex:
             # Disconnect so we can reset state and try again
@@ -1101,7 +1156,7 @@ class TuyaBLEDevice:
             if self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
@@ -1139,8 +1194,7 @@ class TuyaBLEDevice:
             return self._login_key
         elif security_flag == 5:
             return self._session_key
-        else:
-            pass
+        raise TuyaBLEDataFormatError()
 
     def _parse_timestamp(self, data: bytes, start_pos: int) -> tuple(float, int):
         timestamp: float
@@ -1293,7 +1347,7 @@ class TuyaBLEDevice:
             case TuyaBLECode.FUN_RECEIVE_SIGN_DP:
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
-                self._parse_datapoints_v3(time.time(), flags, data, 2)
+                self._parse_datapoints_v3(time.time(), flags, data, 3)
                 data = pack(">HBB", dp_seq_num, flags, 0)
                 asyncio.create_task(self._send_response(code, data, seq_num))
 
@@ -1311,7 +1365,7 @@ class TuyaBLEDevice:
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
                 timestamp, pos = self._parse_timestamp(data, 3)
-                self._parse_datapoints_v3(time.time(), flags, data, pos)
+                self._parse_datapoints_v3(timestamp, flags, data, pos)
                 data = pack(">HBB", dp_seq_num, flags, 0)
                 asyncio.create_task(self._send_response(code, data, seq_num))
 
@@ -1333,6 +1387,7 @@ class TuyaBLEDevice:
         self._input_buffer = None
         self._input_expected_packet_num = 0
         self._input_expected_length = 0
+        self._input_discarding = False
 
     def _parse_input(self) -> None:
         security_flag = self._input_buffer[0]
@@ -1400,48 +1455,73 @@ class TuyaBLEDevice:
     def _notification_handler(self, _sender: int, data: bytearray) -> None:
         """Handle notification responses."""
         _LOGGER.debug("%s: Packet received: %s", self.address, data.hex())
-
-        pos: int = 0
-        packet_num: int
-
-        packet_num, pos = self._unpack_int(data, pos)
-
-        if packet_num < self._input_expected_packet_num:
-            _LOGGER.error(
-                "%s: Unexpcted packet (number %s) in notifications, " "expected %s",
+        try:
+            self._handle_fragment(bytes(data))
+        except Exception as ex:  # noqa: BLE001
+            # Never let a malformed reply escape into the Bluetooth stack.
+            _LOGGER.warning(
+                "%s: Dropped malformed reply (%s: %s)",
                 self.address,
-                packet_num,
-                self._input_expected_packet_num,
+                type(ex).__name__,
+                ex,
             )
             self._clean_input()
 
-        if packet_num == self._input_expected_packet_num:
-            if packet_num == 0:
-                self._input_buffer = bytearray()
-                self._input_expected_length, pos = self._unpack_int(data, pos)
-                pos += 1
-            self._input_buffer += data[pos:]
-            self._input_expected_packet_num += 1
-        else:
-            _LOGGER.error(
-                "%s: Missing packet (number %s) in notifications, received %s",
-                self.address,
-                self._input_expected_packet_num,
-                packet_num,
-            )
-            self._clean_input()
+    def _handle_fragment(self, data: bytes) -> None:
+        """Reassemble one fragment of a multi-packet reply.
+
+        Replies arrive as numbered fragments 0, 1, 2, ... Duplicated
+        fragments are ignored. If a fragment is lost, the rest of that
+        reply is discarded quietly until the next reply starts.
+        """
+        if data == self._input_last_fragment:
+            _LOGGER.debug("%s: Ignoring duplicated fragment", self.address)
             return
 
+        packet_num, pos = self._unpack_int(data, 0)
+
+        if packet_num == 0:
+            if self._input_buffer is not None:
+                _LOGGER.debug(
+                    "%s: New reply started before previous one finished",
+                    self.address,
+                )
+            self._input_buffer = bytearray()
+            self._input_expected_length, pos = self._unpack_int(data, pos)
+            pos += 1  # protocol version byte
+            self._input_expected_packet_num = 0
+            self._input_discarding = False
+        elif self._input_discarding:
+            return
+        elif (
+            self._input_buffer is None
+            or packet_num != self._input_expected_packet_num
+        ):
+            _LOGGER.warning(
+                "%s: Lost part of a reply (expected fragment %s, got %s); "
+                "discarding it; RSSI: %s",
+                self.address,
+                self._input_expected_packet_num,
+                packet_num,
+                self.rssi,
+            )
+            self._clean_input()
+            self._input_discarding = True
+            return
+
+        self._input_last_fragment = data
+        self._input_buffer += data[pos:]
+        self._input_expected_packet_num += 1
+
         if len(self._input_buffer) > self._input_expected_length:
-            _LOGGER.error(
-                "%s: Unexpcted length of data in notifications, "
-                "received %s expected %s",
+            _LOGGER.warning(
+                "%s: Reply longer than announced (%s > %s); discarding it",
                 self.address,
                 len(self._input_buffer),
                 self._input_expected_length,
             )
             self._clean_input()
-            return
+            self._input_discarding = True
         elif len(self._input_buffer) == self._input_expected_length:
             self._parse_input()
 

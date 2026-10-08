@@ -47,6 +47,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
     product_info = get_device_product_info(device)
+    if product_info and product_info.fingerbot:
+        # Fingerbots sleep a few minutes after each press. Connect on
+        # demand instead of waking them in a reconnect loop.
+        device.auto_reconnect = False
 
     coordinator = TuyaBLECoordinator(hass, device)
 
