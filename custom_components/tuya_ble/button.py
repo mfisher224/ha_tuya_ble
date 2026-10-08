@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import logging
-from typing import Callable
+from typing import Awaitable, Callable
 
 from homeassistant.components.button import (
     ButtonEntityDescription,
