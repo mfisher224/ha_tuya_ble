@@ -1,6 +1,7 @@
 """The Tuya BLE integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS, get_device
@@ -32,6 +33,9 @@ PLATFORMS: list[Platform] = [
 
 _LOGGER = logging.getLogger(__name__)
 
+INITIAL_RETRY_MIN_DELAY = 10.0
+INITIAL_RETRY_MAX_DELAY = 600.0
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tuya BLE from a config entry."""
@@ -62,7 +66,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not communicate with Tuya BLE device with address {address}"
         ) from ex
     '''
-    hass.add_job(device.update())
+    async def _async_initial_update() -> None:
+        """Connect once at startup, retrying until it succeeds.
+
+        Entities stay unavailable until the first successful connection, and
+        Home Assistant does not run actions on unavailable entities. Devices
+        that don't auto-reconnect (Fingerbots) would otherwise stay
+        unusable if they were asleep or out of range at startup.
+        """
+        delay = INITIAL_RETRY_MIN_DELAY
+        while True:
+            try:
+                await device.update()
+                return
+            except Exception as ex:  # noqa: BLE001 - BLE errors vary by backend
+                _LOGGER.debug(
+                    "%s: Initial connection failed (%s), retrying in %ss",
+                    address,
+                    ex,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, INITIAL_RETRY_MAX_DELAY)
+
+    entry.async_create_background_task(
+        hass, _async_initial_update(), f"tuya_ble initial connect {address}"
+    )
 
     @callback
     def _async_update_ble(
